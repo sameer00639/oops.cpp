@@ -1,0 +1,112 @@
+#include "Transaction.h"
+
+#include <memory>
+#include <utility>
+#include <vector>
+
+#include "Clock.h"
+#include "Constants.h"
+#include "Csv.h"
+#include "Utils.h"
+
+namespace lms::model {
+
+int Transaction::nextId_ = 0;
+
+Transaction::Transaction(int bookId, int memberId, std::string bookTitle,
+                         std::string memberName, long long issueTimestamp,
+                         long long dueTimestamp, double fineRate)
+    : id_(++nextId_),
+      bookId_(bookId),
+      memberId_(memberId),
+      bookTitle_(std::move(bookTitle)),
+      memberName_(std::move(memberName)),
+      issueDate_(issueTimestamp),
+      dueDate_(dueTimestamp),
+      fineRate_(fineRate) {}
+
+void Transaction::syncNextId(int seen) {
+    if (seen > nextId_) nextId_ = seen;
+}
+
+void Transaction::extendDue(long long days) {
+    dueDate_ += days * util::Clock::DAY;
+}
+
+double Transaction::fineIfReturnedAt(long long returnTimestamp) const {
+    const double rate = fineRate_ > 0.0 ? fineRate_ : config::DEFAULT_FINE_RATE;
+    const long long lateDays = util::Clock::daysLate(dueDate_, returnTimestamp);
+    return static_cast<double>(lateDays) * rate;
+}
+
+void Transaction::close(long long returnTimestamp) {
+    returnDate_ = returnTimestamp;
+    fine_ = fineIfReturnedAt(returnTimestamp);
+    paid_ = fine_ <= 0.0;   // nothing to pay => nothing pending
+}
+
+// CSV columns: id,bookId,memberId,bookTitle,memberName,issue,due,returned,rate,fine,paid
+std::string Transaction::save() const {
+    return io::encodeRow({
+        std::to_string(id_),
+        std::to_string(bookId_),
+        std::to_string(memberId_),
+        bookTitle_,
+        memberName_,
+        std::to_string(issueDate_),
+        std::to_string(dueDate_),
+        std::to_string(returnDate_),
+        std::to_string(fineRate_),
+        std::to_string(fine_),
+        paid_ ? "1" : "0",
+    });
+}
+
+bool Transaction::load(const std::string& row) {
+    const std::vector<std::string> f = io::decodeRow(row);
+    if (f.size() < 8) return false;
+
+    id_ = util::toInt(f[0], -1);
+    if (id_ <= 0) return false;
+    bookId_ = util::toInt(f[1], -1);
+    memberId_ = util::toInt(f[2], -1);
+    if (bookId_ < 0 || memberId_ < 0) return false;
+    bookTitle_ = f[3];
+    memberName_ = f[4];
+    issueDate_ = util::toLong(f[5]);
+    dueDate_ = util::toLong(f[6]);
+    returnDate_ = util::toLong(f[7]);
+    fineRate_ = f.size() > 8 ? util::toDouble(f[8], config::DEFAULT_FINE_RATE)
+                             : config::DEFAULT_FINE_RATE;
+    fine_ = f.size() > 9 ? util::toDouble(f[9]) : 0.0;
+    paid_ = f.size() > 10 && f[10] == "1";
+    return true;
+}
+
+Transaction* Transaction::createFromRow(const std::string& row) {
+    auto txn = std::make_unique<Transaction>();
+    if (!txn->load(row)) return nullptr;
+    return txn.release();
+}
+
+void Transaction::print(std::ostream& os, const std::string& bookTitle,
+                        const std::string& memberName) const {
+    os << "#" << id_ << "  book [" << bookId_ << "] " << bookTitle
+       << "  ->  member [" << memberId_ << "] " << memberName
+       << "  issued " << util::Clock::format(issueDate_)
+       << "  due " << util::Clock::format(dueDate_);
+    if (isOpen()) {
+        os << "  |  still out";
+    } else {
+        os << "  |  returned " << util::Clock::format(returnDate_)
+           << "  |  fine " << util::money(fine_);
+        if (fine_ > 0.0) os << (paid_ ? " (paid)" : " (unpaid)");
+    }
+}
+
+std::ostream& operator<<(std::ostream& os, const Transaction& txn) {
+    txn.print(os, txn.getBookTitle(), txn.getMemberName());
+    return os;
+}
+
+} // namespace lms::model
